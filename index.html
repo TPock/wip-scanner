@@ -64,6 +64,23 @@
   ul#list li .num { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
   ul#list li .meta { font-size: 13px; color: var(--muted); }
   ul#list li .acts { display: flex; gap: 8px; margin-top: 4px; }
+  ul#list li.group { gap: 8px; }
+  ul#list li.group.incomplete { border-left: 5px solid var(--accent); }
+  ul#list li.group.complete { border-left: 5px solid #2e8b57; }
+  .badge { font-size: 13px; font-weight: 700; padding: 3px 8px; border-radius: 999px; white-space: nowrap; }
+  .badge.ok { background: var(--ok-bg); color: var(--ok-ink); }
+  .badge.warn { background: var(--warn-bg); color: var(--warn-ink); }
+  .pack { border-top: 1px dashed var(--line); padding-top: 8px; display: grid; gap: 2px; }
+  .pack .pk { font-weight: 700; }
+  .pack.missing .pk { color: var(--warn-ink); }
+  .pack-wrap { display: flex; align-items: center; gap: 8px; font-size: 18px; }
+  .pack-wrap input { width: 72px; text-align: center; font-size: 22px; font-weight: 700; }
+  #summary { font-size: 14px; color: var(--muted); margin-top: 6px; }
+  .toggle { display: flex; align-items: center; gap: 8px; font-size: 14px; margin-top: 8px; }
+  .toggle input { width: 20px; height: 20px; }
+  #toast { position: fixed; left: 16px; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom)); z-index: 2000;
+    max-width: 688px; margin: 0 auto; padding: 14px 16px; border-radius: 12px; font-weight: 600;
+    box-shadow: 0 6px 24px #0004; transition: opacity .3s; }
   .empty { color: var(--muted); font-size: 14px; padding: 8px 0; }
   .ilo-tip { font-weight: 700; font-size: 12px; }
   footer { text-align: center; color: var(--muted); font-size: 12px; padding: 8px 16px 24px; }
@@ -86,6 +103,10 @@
     <label class="field">ILO number
       <div class="ilo-wrap"><b>ILO</b><input id="ilo" type="text" inputmode="numeric" autocomplete="off" maxlength="6" placeholder="000000"></div>
     </label>
+    <label class="field">Pack (leave 1 of 1 if the label has no “x of y”)
+      <div class="pack-wrap"><input id="pack" type="text" inputmode="numeric" maxlength="2" value="1"> of <input id="of" type="text" inputmode="numeric" maxlength="2" value="1"></div>
+    </label>
+    <div id="packHint" class="pill info" hidden></div>
     <div class="row" style="align-items:center">
       <div id="gpsStatus" class="pill info" style="flex:1 1 60%">Getting location…</div>
       <button id="gpsRetry" class="secondary small" style="flex:0 0 auto" hidden>Retry GPS</button>
@@ -109,9 +130,12 @@
         <button id="clearBtn" class="small danger">Clear</button>
       </div>
     </div>
+    <div id="summary"></div>
+    <label class="toggle"><input id="onlyIncomplete" type="checkbox"> Show only ILOs with missing packs</label>
     <ul id="list"></ul>
   </section>
 </main>
+<div id="toast" hidden></div>
 <footer>Photos are read on this phone and never uploaded. The list is saved on this phone only until you export it.</footer>
 
 <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -124,8 +148,30 @@
   // ---------- storage (phone only) ----------
   let items = [];
   try { items = JSON.parse(localStorage.getItem(STORE_KEY)) || []; } catch { items = []; }
+  items.forEach(it => { it.pack = it.pack || 1; it.of = it.of || 1; }); // scans saved before pack tracking
   function persist() {
     try { localStorage.setItem(STORE_KEY, JSON.stringify(items)); } catch { /* private mode etc. */ }
+  }
+
+  // Group scans by ILO and work out which packs are still missing.
+  function groupsOf(list) {
+    const byIlo = new Map();
+    for (const it of list) { if (!byIlo.has(it.ilo)) byIlo.set(it.ilo, []); byIlo.get(it.ilo).push(it); }
+    return [...byIlo].map(([ilo, packs]) => {
+      packs.sort((a, b) => a.pack - b.pack);
+      const of = Math.max(...packs.map(p => p.of));
+      const have = new Set(packs.map(p => p.pack));
+      const missing = [];
+      for (let i = 1; i <= of; i++) if (!have.has(i)) missing.push(i);
+      const mismatch = new Set(packs.map(p => p.of)).size > 1;
+      return { ilo, packs, of, missing, mismatch, complete: !missing.length && !mismatch,
+               last: Math.max(...packs.map(p => +new Date(p.ts))) };
+    }).sort((a, b) => b.last - a.last);
+  }
+  function groupStatus(g) {
+    if (g.mismatch) return { cls: 'warn', text: 'Check totals: labels disagree (' + [...new Set(g.packs.map(p => p.of))].join(' / ') + ')' };
+    if (g.missing.length) return { cls: 'warn', text: `${g.packs.length} of ${g.of} · missing pack ${g.missing.join(', ')}` };
+    return { cls: 'ok', text: g.of > 1 ? `All ${g.of} packs ✓` : 'Single pack ✓' };
   }
 
   // ---------- map ----------
@@ -142,35 +188,58 @@
   function drawMarkers(fit) {
     markerLayer.clearLayers(); markers.clear();
     const pts = [];
-    for (const it of items) {
-      if (it.lat == null) continue;
-      const m = L.circleMarker([it.lat, it.lng], { radius: 8, color: '#fff', weight: 2, fillColor: '#c8702a', fillOpacity: 1 })
-        .bindTooltip(it.ilo, { permanent: true, direction: 'top', offset: [0, -8], className: 'ilo-tip' })
-        .bindPopup(`<b>ILO ${esc(it.ilo)}</b><br>${esc(fmtTime(it.ts))}${it.note ? '<br>' + esc(it.note) : ''}<br>±${it.acc} m`);
-      m.addTo(markerLayer); markers.set(it.id, m); pts.push([it.lat, it.lng]);
+    for (const g of groupsOf(items)) {
+      const st = groupStatus(g);
+      for (const it of g.packs) {
+        if (it.lat == null) continue;
+        const label = it.of > 1 ? `${it.ilo} (${it.pack}/${it.of})` : it.ilo;
+        const m = L.circleMarker([it.lat, it.lng], { radius: 8, color: '#fff', weight: 2, fillColor: g.complete ? '#2e8b57' : '#c8702a', fillOpacity: 1 })
+          .bindTooltip(label, { permanent: true, direction: 'top', offset: [0, -8], className: 'ilo-tip' })
+          .bindPopup(`<b>ILO ${esc(it.ilo)}</b> · pack ${it.pack} of ${it.of}<br>${esc(st.text)}<br>${esc(fmtTime(it.ts))}${it.note ? '<br>' + esc(it.note) : ''}<br>±${it.acc} m`);
+        m.addTo(markerLayer); markers.set(it.id, m); pts.push([it.lat, it.lng]);
+      }
     }
     if (fit && pts.length) map.fitBounds(pts, { padding: [40, 40], maxZoom: 19 });
   }
 
   // ---------- list ----------
   function render(fit) {
-    $('count').textContent = `${items.length} scanned`;
+    const groups = groupsOf(items);
+    const open = groups.filter(g => !g.complete);
+    $('count').textContent = `${groups.length} ILO${groups.length === 1 ? '' : 's'} · ${items.length} pack${items.length === 1 ? '' : 's'}`;
+    $('summary').innerHTML = !groups.length ? '' : open.length
+      ? `<span class="badge warn">${open.length} ILO${open.length === 1 ? '' : 's'} with missing packs or a problem</span>`
+      : `<span class="badge ok">All scanned ILOs complete ✓</span>`;
     const ul = $('list'); ul.innerHTML = '';
     if (!items.length) { ul.innerHTML = '<li class="empty" style="border:0">Nothing scanned yet. Tap “Scan label” to start.</li>'; }
-    for (const it of [...items].reverse()) {
+    const shown = $('onlyIncomplete').checked ? open : groups;
+    if (items.length && !shown.length) ul.innerHTML = '<li class="empty" style="border:0">No missing packs 👍</li>';
+    for (const g of shown) {
+      const st = groupStatus(g);
       const li = document.createElement('li');
-      li.innerHTML = `
-        <div class="top"><span class="num">ILO ${esc(it.ilo)}</span><span class="meta">${esc(fmtTime(it.ts))}</span></div>
-        ${it.note ? `<div>${esc(it.note)}</div>` : ''}
-        <div class="meta">${it.lat != null ? `${it.lat.toFixed(6)}, ${it.lng.toFixed(6)} · ±${it.acc} m` : 'No location recorded'}</div>
-        <div class="acts">
-          ${it.lat != null ? '<button class="small secondary" data-act="show">Show on map</button>' : ''}
-          <button class="small danger" data-act="del">Delete</button>
-        </div>`;
+      li.className = 'group ' + (g.complete ? 'complete' : 'incomplete');
+      let rows = '';
+      for (let n = 1; n <= g.of; n++) {
+        const scans = g.packs.filter(p => p.pack === n);
+        if (!scans.length) { rows += `<div class="pack missing"><span class="pk">Pack ${n} of ${g.of}: not scanned yet</span></div>`; continue; }
+        for (const it of scans) rows += `
+          <div class="pack">
+            <div class="top"><span class="pk">${g.of > 1 ? `Pack ${it.pack} of ${it.of}` : 'Single pack'}</span><span class="meta">${esc(fmtTime(it.ts))}</span></div>
+            ${it.note ? `<div>${esc(it.note)}</div>` : ''}
+            <div class="meta">${it.lat != null ? `${it.lat.toFixed(6)}, ${it.lng.toFixed(6)} · ±${it.acc} m` : 'No location recorded'}</div>
+            <div class="acts">
+              ${it.lat != null ? `<button class="small secondary" data-act="show" data-id="${it.id}">Show on map</button>` : ''}
+              <button class="small danger" data-act="del" data-id="${it.id}">Delete</button>
+            </div>
+          </div>`;
+      }
+      li.innerHTML = `<div class="top"><span class="num">ILO ${esc(g.ilo)}</span><span class="badge ${st.cls}">${esc(st.text)}</span></div>${rows}`;
       li.addEventListener('click', e => {
-        const act = e.target.dataset && e.target.dataset.act;
+        const { act, id } = e.target.dataset || {};
+        const it = items.find(x => x.id === id);
+        if (!it) return;
         if (act === 'show') { map.setView([it.lat, it.lng], 19); markers.get(it.id)?.openPopup(); $('map').scrollIntoView({ behavior: 'smooth', block: 'center' }); }
-        if (act === 'del' && confirm(`Delete ILO ${it.ilo} from the list?`)) { items = items.filter(x => x.id !== it.id); persist(); render(); }
+        if (act === 'del' && confirm(`Delete ILO ${it.ilo} pack ${it.pack} of ${it.of} from the list?`)) { items = items.filter(x => x.id !== it.id); persist(); render(); }
       });
       ul.appendChild(li);
     }
@@ -188,25 +257,38 @@
     return workerPromise;
   }
 
-  // Scale down + greyscale + stretch contrast: faster and more accurate on phone photos.
+  // Scale down + greyscale. (Tested: contrast stretching made reads worse on these labels.)
   async function prepImage(file) {
     const url = URL.createObjectURL(file);
     const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url; });
-    const max = 1800, s = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
-    const c = document.createElement('canvas');
-    c.width = Math.round(img.naturalWidth * s); c.height = Math.round(img.naturalHeight * s);
-    const ctx = c.getContext('2d', { willReadFrequently: true });
-    ctx.drawImage(img, 0, 0, c.width, c.height);
-    const d = ctx.getImageData(0, 0, c.width, c.height), px = d.data;
-    let lo = 255, hi = 0;
-    for (let i = 0; i < px.length; i += 4) {
-      const g = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
-      px[i] = g; if (g < lo) lo = g; if (g > hi) hi = g;
+    const sized = max => {
+      const s = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.naturalWidth * s); c.height = Math.round(img.naturalHeight * s);
+      const ctx = c.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(img, 0, 0, c.width, c.height);
+      const d = ctx.getImageData(0, 0, c.width, c.height), px = d.data;
+      for (let i = 0; i < px.length; i += 4) px[i] = px[i + 1] = px[i + 2] = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
+      ctx.putImageData(d, 0, 0);
+      return c;
+    };
+    return { big: sized(1800), small: sized(1200), url };
+  }
+
+  // Try a few reading setups until one finds "ILO ######". Sparse-text mode (11) worked best in testing.
+  async function readLabel(worker, prepped) {
+    const passes = [[prepped.big, '11'], [prepped.small, '3'], [prepped.small, '11']];
+    let best = null, pack = null;
+    for (const [canvas, psm] of passes) {
+      await worker.setParameters({ tessedit_pageseg_mode: psm });
+      const { data } = await worker.recognize(canvas);
+      const r = findIlo(data.text || '');
+      pack = pack || findPack(data.text || '');
+      if (!best || (r.sure && !best.sure) || (!best.best && r.best)) best = r;
+      if (r.sure && pack) break;
+      if (r.sure && psm === '3') break; // second opinion done; single-pack labels have no "x of y"
     }
-    const range = Math.max(1, hi - lo);
-    for (let i = 0; i < px.length; i += 4) { const g = (px[i] - lo) * 255 / range; px[i] = px[i + 1] = px[i + 2] = g; }
-    ctx.putImageData(d, 0, 0);
-    return { canvas: c, url };
+    return { r: best, pk: pack };
   }
 
   // Pull the ILO number out of the OCR text, allowing for common misreads (1/l/| for I, 0/Q for O).
@@ -220,6 +302,31 @@
     const loose = [...new Set((t.match(/\b\d{6}\b/g) || []))];
     return { best: loose[0] || '', all: loose, sure: false };
   }
+
+  // "1 of 2" printed under the ILO number. No match = single pack.
+  function findPack(text) {
+    const t = text.toUpperCase().replace(/[|!]/g, 'I');
+    const m = t.match(/(?:^|[^0-9A-Z])([0-9LI]{1,2})\s*[O0Q]\s*F\s*([0-9LI]{1,2})(?![0-9A-Z])/m);
+    if (!m) return null;
+    const num = s => parseInt(s.replace(/[LI]/g, '1'), 10);
+    const pack = num(m[1]), of = num(m[2]);
+    return pack >= 1 && of >= pack && of <= 50 ? { pack, of } : null;
+  }
+
+  // Tell the user what this scan means for the ILO before they save it.
+  function updatePackHint() {
+    const ilo = $('ilo').value, pack = +$('pack').value, of = +$('of').value, el = $('packHint');
+    const prev = items.filter(x => x.ilo === ilo);
+    if (ilo.length !== 6 || !prev.length) { el.hidden = true; return; }
+    el.hidden = false;
+    const g = groupsOf([...prev.filter(x => x.pack !== pack), { ilo, pack, of, ts: new Date().toISOString() }])[0];
+    const had = prev.map(p => `${p.pack} of ${p.of}`).join(', ');
+    if (prev.some(p => p.pack === pack)) { el.className = 'pill warn'; el.textContent = `Pack ${pack} of ILO ${ilo} is already on the list. Saving will replace it.`; }
+    else if (g.mismatch) { el.className = 'pill warn'; el.textContent = `Already have ${had}, but this label says “of ${of}”. Check the label.`; }
+    else if (g.complete) { el.className = 'pill ok'; el.textContent = `Already have ${had}. This completes ILO ${ilo} ✓`; }
+    else { el.className = 'pill info'; el.textContent = `Already have ${had}. Still missing pack ${g.missing.join(', ')} after this one.`; }
+  }
+  ['ilo', 'pack', 'of'].forEach(id => $(id).addEventListener('input', updatePackHint));
 
   // ---------- GPS: watch for a few seconds and keep the most accurate fix ----------
   let gps = null, gpsWatch = null, gpsTimer = null;
@@ -262,26 +369,27 @@
   async function handlePhoto(file) {
     startGps();
     $('review').hidden = false;
-    $('ilo').value = ''; $('note').value = '';
-    $('candidates').hidden = true;
+    $('ilo').value = ''; $('note').value = ''; $('pack').value = 1; $('of').value = 1;
+    $('candidates').hidden = true; $('packHint').hidden = true;
     $('scanBtn').setAttribute('aria-disabled', 'true');
     setOcr('info', 'Reading label…');
     $('review').scrollIntoView({ behavior: 'smooth', block: 'start' });
     try {
-      const { canvas, url } = await prepImage(file);
+      const prepped = await prepImage(file);
       if (current?.url) URL.revokeObjectURL(current.url);
-      current = { url };
-      $('preview').src = url;
+      current = { url: prepped.url };
+      $('preview').src = prepped.url;
       const worker = await getWorker();
-      const { data } = await worker.recognize(canvas);
-      const r = findIlo(data.text || '');
+      const { r, pk } = await readLabel(worker, prepped);
       $('ilo').value = r.best;
-      if (r.best && r.sure) setOcr('ok', 'Found the ILO number. Check it matches the label.');
+      if (pk) { $('pack').value = pk.pack; $('of').value = pk.of; }
+      updatePackHint();
+      if (r.best && r.sure) setOcr('ok', `Found the ILO number${pk ? ` (pack ${pk.pack} of ${pk.of})` : ''}. Check it matches the label.`);
       else if (r.best) setOcr('warn', 'Not sure this is the ILO number. Please check it.');
       else setOcr('warn', 'Couldn’t read the number. Type it in, or discard and retake closer and straight on.');
       if (r.all.length > 1) {
         const box = $('candidates'); box.innerHTML = ''; box.hidden = false;
-        r.all.forEach(n => { const b = document.createElement('button'); b.textContent = n; b.onclick = () => { $('ilo').value = n; }; box.appendChild(b); });
+        r.all.forEach(n => { const b = document.createElement('button'); b.textContent = n; b.onclick = () => { $('ilo').value = n; updatePackHint(); }; box.appendChild(b); });
       }
     } catch (err) {
       console.error(err);
@@ -294,21 +402,35 @@
   $('saveBtn').addEventListener('click', () => {
     const ilo = $('ilo').value.replace(/\D/g, '');
     if (ilo.length !== 6) { alert('ILO number should be 6 digits.'); $('ilo').focus(); return; }
+    const pack = parseInt($('pack').value, 10), of = parseInt($('of').value, 10);
+    if (!(pack >= 1 && of >= pack)) { alert('Pack should read like “1 of 2”: first number 1 or more, and not bigger than the second.'); $('pack').focus(); return; }
     if (!gps && !confirm('No location yet. Save without a location?')) return;
+    const same = items.find(x => x.ilo === ilo && x.pack === pack);
+    if (same && !confirm(`ILO ${ilo} pack ${pack} of ${of} is already on the list. Replace it with this new scan and location?`)) return;
+    const others = items.filter(x => x.ilo === ilo && x.pack !== pack);
+    if (others.some(x => x.of !== of) &&
+        !confirm(`Other packs of ILO ${ilo} say “of ${others[0].of}”, but this one says “of ${of}”. Save anyway?`)) return;
     const entry = {
       id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-      ilo, ts: new Date().toISOString(), note: $('note').value.trim(),
+      ilo, pack, of, ts: new Date().toISOString(), note: $('note').value.trim(),
       lat: gps ? gps.lat : null, lng: gps ? gps.lng : null, acc: gps ? gps.acc : null
     };
-    const existing = items.find(x => x.ilo === ilo);
-    if (existing) {
-      if (!confirm(`ILO ${ilo} is already on the list. Replace it with this new scan and location?`)) return;
-      items = items.filter(x => x.ilo !== ilo);
-    }
+    items = items.filter(x => x !== same);
     items.push(entry); persist();
     closeReview(); render();
     if (entry.lat != null) { map.setView([entry.lat, entry.lng], 19); markers.get(entry.id)?.openPopup(); }
+    const g = groupsOf(items).find(x => x.ilo === ilo), st = groupStatus(g);
+    toast(st.cls, of > 1 ? `ILO ${ilo} pack ${pack} of ${of} saved. ${g.complete ? 'All packs scanned ✓' : st.text}` : `ILO ${ilo} saved ✓`);
   });
+  $('onlyIncomplete').addEventListener('change', () => render());
+
+  let toastTimer = null;
+  function toast(kind, msg) {
+    const el = $('toast');
+    el.className = 'pill ' + kind; el.textContent = msg; el.hidden = false; el.style.opacity = 1;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { el.style.opacity = 0; setTimeout(() => { el.hidden = true; }, 300); }, 4000);
+  }
   $('discardBtn').addEventListener('click', closeReview);
   $('gpsRetry').addEventListener('click', startGps);
   $('ilo').addEventListener('input', e => { e.target.value = e.target.value.replace(/\D/g, '').slice(0, 6); });
@@ -323,11 +445,20 @@
   // ---------- export ----------
   $('exportBtn').addEventListener('click', async () => {
     if (!items.length) { alert('Nothing to export yet.'); return; }
-    const head = ['ILO', 'Scanned', 'Latitude', 'Longitude', 'Accuracy (m)', 'Note', 'Map link'];
-    const rows = items.map(it => [
-      'ILO ' + it.ilo, fmtTime(it.ts), it.lat ?? '', it.lng ?? '', it.acc ?? '', it.note || '',
-      it.lat != null ? `https://www.google.com/maps?q=${it.lat},${it.lng}` : ''
-    ]);
+    const head = ['ILO', 'Pack', 'Of', 'ILO status', 'Scanned', 'Latitude', 'Longitude', 'Accuracy (m)', 'Note', 'Map link'];
+    const rows = [];
+    for (const g of groupsOf(items)) {
+      const status = groupStatus(g).text.replace(' ✓', '');
+      for (let n = 1; n <= g.of; n++) {
+        const scans = g.packs.filter(p => p.pack === n);
+        if (!scans.length) rows.push([g.ilo, n, g.of, status, 'NOT SCANNED', '', '', '', '', '']);
+        for (const it of scans) rows.push([
+          it.ilo, it.pack, it.of, status, fmtTime(it.ts),
+          it.lat != null ? it.lat.toFixed(6) : '', it.lng != null ? it.lng.toFixed(6) : '', it.acc ?? '', it.note || '',
+          it.lat != null ? `https://www.google.com/maps?q=${it.lat.toFixed(6)},${it.lng.toFixed(6)}` : ''
+        ]);
+      }
+    }
     const csv = [head, ...rows].map(r => r.map(csvCell).join(',')).join('\r\n');
     const name = `WIP scan ${new Date().toISOString().slice(0, 16).replace('T', ' ').replace(':', '')}.csv`;
     const file = new File(['﻿' + csv], name, { type: 'text/csv' });
@@ -357,7 +488,7 @@
   // Warm the OCR reader in the background so the first scan is quicker.
   setTimeout(() => getWorker().catch(() => {}), 1500);
 
-  window.__wip = { handlePhoto, findIlo }; // for testing
+  window.__wip = { handlePhoto, findIlo, findPack }; // for testing
   render(true);
 })();
 </script>
