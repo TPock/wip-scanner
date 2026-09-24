@@ -81,6 +81,16 @@
   #toast { position: fixed; left: 16px; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom)); z-index: 2000;
     max-width: 688px; margin: 0 auto; padding: 14px 16px; border-radius: 12px; font-weight: 600;
     box-shadow: 0 6px 24px #0004; transition: opacity .3s; }
+  .visually-hidden { position: absolute; width: 1px; height: 1px; opacity: 0; overflow: hidden; pointer-events: none; }
+  .err-box { background: var(--warn-bg); color: var(--warn-ink); border: 2px solid var(--accent); border-radius: 10px;
+    padding: 12px; display: grid; gap: 10px; font-weight: 600; }
+  .err-box button.secondary { background: var(--card); }
+  .modal-bg { position: fixed; inset: 0; z-index: 3000; background: #000a; display: flex; align-items: flex-end; justify-content: center;
+    padding: 16px 16px calc(16px + env(safe-area-inset-bottom)); }
+  .modal { background: var(--card); color: var(--ink); border-radius: 14px; padding: 18px; width: 100%; max-width: 480px;
+    display: grid; gap: 14px; font-size: 17px; }
+  .modal-acts { display: grid; gap: 10px; }
+  .modal-acts button { min-height: 52px; }
   .empty { color: var(--muted); font-size: 14px; padding: 8px 0; }
   .ilo-tip { font-weight: 700; font-size: 12px; }
   footer { text-align: center; color: var(--muted); font-size: 12px; padding: 8px 16px 24px; }
@@ -93,12 +103,19 @@
 </header>
 
 <main>
-  <label class="big-btn" id="scanBtn" for="cam">📷 Scan label</label>
-  <input id="cam" type="file" accept="image/*" capture="environment" hidden>
+  <button class="big-btn" id="scanBtn" type="button">📷 Scan label</button>
+  <input id="cam" class="visually-hidden" type="file" accept="image/*" capture="environment" tabindex="-1" aria-hidden="true">
 
   <section id="review" class="card" hidden>
     <img id="preview" alt="Captured label">
     <div id="ocrStatus" class="pill info">Reading label…</div>
+    <div id="readError" class="err-box" hidden>
+      <div id="readErrorMsg"></div>
+      <div class="row">
+        <button id="rescanBtn" type="button">📷 Rescan</button>
+        <button id="typeBtn" type="button" class="secondary">⌨️ Type it in</button>
+      </div>
+    </div>
     <div id="candidates" class="chips" hidden></div>
     <label class="field">ILO number
       <div class="ilo-wrap"><b>ILO</b><input id="ilo" type="text" inputmode="numeric" autocomplete="off" maxlength="6" placeholder="000000"></div>
@@ -136,6 +153,16 @@
   </section>
 </main>
 <div id="toast" hidden></div>
+<div id="modal" class="modal-bg" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalMsg">
+    <div id="modalMsg"></div>
+    <div class="modal-acts">
+      <button id="modalPrimary" type="button"></button>
+      <button id="modalDiscard" type="button" class="danger">Discard it and scan</button>
+      <button id="modalCancel" type="button" class="secondary">Go back</button>
+    </div>
+  </div>
+</div>
 <footer>Photos are read on this phone and never uploaded. The list is saved on this phone only until you export it.</footer>
 
 <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -370,7 +397,7 @@
     startGps();
     $('review').hidden = false;
     $('ilo').value = ''; $('note').value = ''; $('pack').value = 1; $('of').value = 1;
-    $('candidates').hidden = true; $('packHint').hidden = true;
+    $('candidates').hidden = true; $('packHint').hidden = true; $('readError').hidden = true;
     $('scanBtn').setAttribute('aria-disabled', 'true');
     setOcr('info', 'Reading label…');
     $('review').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -385,31 +412,67 @@
       if (pk) { $('pack').value = pk.pack; $('of').value = pk.of; }
       updatePackHint();
       if (r.best && r.sure) setOcr('ok', `Found the ILO number${pk ? ` (pack ${pk.pack} of ${pk.of})` : ''}. Check it matches the label.`);
-      else if (r.best) setOcr('warn', 'Not sure this is the ILO number. Please check it.');
-      else setOcr('warn', 'Couldn’t read the number. Type it in, or discard and retake closer and straight on.');
+      else if (r.best) { setOcr('warn', 'Not sure this is the ILO number.'); showReadError('Check the number below matches the label. If it doesn’t, rescan or type it in.'); }
+      else { setOcr('warn', 'Couldn’t find an ILO number on that photo.'); showReadError('No ILO number found. Rescan (closer, straight on, no glare) or type it in.'); }
       if (r.all.length > 1) {
         const box = $('candidates'); box.innerHTML = ''; box.hidden = false;
         r.all.forEach(n => { const b = document.createElement('button'); b.textContent = n; b.onclick = () => { $('ilo').value = n; updatePackHint(); }; box.appendChild(b); });
       }
     } catch (err) {
       console.error(err);
-      setOcr('warn', 'Couldn’t read the photo. Type the number in, or check you have signal (the reader downloads once on first use).');
+      setOcr('warn', 'Couldn’t read the photo.');
+      showReadError('Something went wrong reading the photo (the reader needs signal the first time). Rescan or type the number in.');
     } finally {
       $('scanBtn').removeAttribute('aria-disabled');
     }
   }
 
-  $('saveBtn').addEventListener('click', () => {
+  function showReadError(msg) {
+    $('readErrorMsg').textContent = msg; $('readError').hidden = false;
+    $('readError').scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+  $('rescanBtn').addEventListener('click', () => $('cam').click());
+  $('typeBtn').addEventListener('click', () => { $('ilo').focus(); $('ilo').select(); });
+
+  // Tapping "Scan label" with an unsaved scan open asks what to do with it first.
+  const reviewOpen = () => !$('review').hidden;
+  $('scanBtn').addEventListener('click', () => {
+    if (!reviewOpen()) { $('cam').click(); return; }
+    const ilo = $('ilo').value, pack = $('pack').value, of = $('of').value;
+    const hasIlo = ilo.length === 6;
+    $('modalMsg').innerHTML = hasIlo
+      ? `You haven’t added <b>ILO ${esc(ilo)}</b>${+of > 1 ? ` (pack ${esc(pack)} of ${esc(of)})` : ''} to the list yet.`
+      : 'The last scan has <b>no ILO number</b> and hasn’t been added to the list.';
+    $('modalPrimary').textContent = hasIlo ? 'Add it, then scan next' : 'Type the number in';
+    $('modal').hidden = false;
+  });
+  $('modalPrimary').addEventListener('click', () => {
+    $('modal').hidden = true;
+    if ($('ilo').value.length !== 6) { $('ilo').focus(); return; }
+    if (saveCurrent()) $('cam').click();
+  });
+  $('modalDiscard').addEventListener('click', () => { $('modal').hidden = true; closeReview(); $('cam').click(); });
+  $('modalCancel').addEventListener('click', () => { $('modal').hidden = true; });
+  $('modal').addEventListener('click', e => { if (e.target === $('modal')) $('modal').hidden = true; });
+  window.addEventListener('beforeunload', e => { if (reviewOpen()) { e.preventDefault(); e.returnValue = ''; } });
+
+  $('saveBtn').addEventListener('click', () => saveCurrent());
+
+  // Returns true if the scan was added to the list.
+  function saveCurrent() {
     const ilo = $('ilo').value.replace(/\D/g, '');
-    if (ilo.length !== 6) { alert('ILO number should be 6 digits.'); $('ilo').focus(); return; }
+    if (ilo.length !== 6) {
+      showReadError(ilo ? `ILO number needs 6 digits (you have ${ilo.length}). Rescan or finish typing it.` : 'No ILO number yet. Rescan or type it in.');
+      $('ilo').focus(); return false;
+    }
     const pack = parseInt($('pack').value, 10), of = parseInt($('of').value, 10);
-    if (!(pack >= 1 && of >= pack)) { alert('Pack should read like “1 of 2”: first number 1 or more, and not bigger than the second.'); $('pack').focus(); return; }
-    if (!gps && !confirm('No location yet. Save without a location?')) return;
+    if (!(pack >= 1 && of >= pack)) { alert('Pack should read like “1 of 2”: first number 1 or more, and not bigger than the second.'); $('pack').focus(); return false; }
+    if (!gps && !confirm('No location yet. Save without a location?')) return false;
     const same = items.find(x => x.ilo === ilo && x.pack === pack);
-    if (same && !confirm(`ILO ${ilo} pack ${pack} of ${of} is already on the list. Replace it with this new scan and location?`)) return;
+    if (same && !confirm(`ILO ${ilo} pack ${pack} of ${of} is already on the list. Replace it with this new scan and location?`)) return false;
     const others = items.filter(x => x.ilo === ilo && x.pack !== pack);
     if (others.some(x => x.of !== of) &&
-        !confirm(`Other packs of ILO ${ilo} say “of ${others[0].of}”, but this one says “of ${of}”. Save anyway?`)) return;
+        !confirm(`Other packs of ILO ${ilo} say “of ${others[0].of}”, but this one says “of ${of}”. Save anyway?`)) return false;
     const entry = {
       id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
       ilo, pack, of, ts: new Date().toISOString(), note: $('note').value.trim(),
@@ -421,7 +484,8 @@
     if (entry.lat != null) { map.setView([entry.lat, entry.lng], 19); markers.get(entry.id)?.openPopup(); }
     const g = groupsOf(items).find(x => x.ilo === ilo), st = groupStatus(g);
     toast(st.cls, of > 1 ? `ILO ${ilo} pack ${pack} of ${of} saved. ${g.complete ? 'All packs scanned ✓' : st.text}` : `ILO ${ilo} saved ✓`);
-  });
+    return true;
+  }
   $('onlyIncomplete').addEventListener('change', () => render());
 
   let toastTimer = null;
@@ -433,7 +497,10 @@
   }
   $('discardBtn').addEventListener('click', closeReview);
   $('gpsRetry').addEventListener('click', startGps);
-  $('ilo').addEventListener('input', e => { e.target.value = e.target.value.replace(/\D/g, '').slice(0, 6); });
+  $('ilo').addEventListener('input', e => {
+    e.target.value = e.target.value.replace(/\D/g, '').slice(0, 6);
+    if (e.target.value.length === 6) $('readError').hidden = true;
+  });
 
   function closeReview() {
     stopGps(); gps = null;
