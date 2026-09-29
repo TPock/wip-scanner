@@ -91,6 +91,23 @@
     display: grid; gap: 14px; font-size: 17px; }
   .modal-acts { display: grid; gap: 10px; }
   .modal-acts button { min-height: 52px; }
+  .pack-body { display: flex; gap: 10px; align-items: flex-start; }
+  .pack-body > div { flex: 1; display: grid; gap: 2px; min-width: 0; }
+  .title-row { display: flex; align-items: center; gap: 8px; }
+  button.icon-btn { min-height: 40px; width: 40px; padding: 0; display: inline-flex; align-items: center; justify-content: center;
+    background: transparent; color: var(--ink); border: 1px solid var(--line); border-radius: 10px; flex: 0 0 auto; }
+  button.icon-btn[aria-expanded="true"] { background: var(--brand); color: var(--brand-ink); border-color: var(--brand); }
+  .search-row { display: flex; gap: 8px; margin-top: 10px; }
+  .search-row input { flex: 1; font: inherit; font-size: 18px; padding: 10px 12px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink); min-width: 0; }
+  #lightbox { align-items: center; }
+  .lb-inner { display: flex; flex-direction: column; align-items: center; gap: 10px; max-width: 100%; max-height: 100%; }
+  #lightboxImg { max-width: 100%; max-height: calc(100vh - 170px); border-radius: 8px; }
+  .lb-cap { background: var(--card); color: var(--ink); border-radius: 12px; padding: 10px 18px; text-align: center; }
+  .lb-label { font-size: 13px; color: var(--muted); }
+  .lb-ilo { font-size: 28px; font-weight: 800; letter-spacing: .04em; font-variant-numeric: tabular-nums; }
+  .lb-hint { font-size: 12px; color: var(--muted); }
+  mark { background: #ffe08a; color: #1c1c1c; border-radius: 3px; padding: 0 1px; }
   .empty { color: var(--muted); font-size: 14px; padding: 8px 0; }
   .ilo-tip { font-weight: 700; font-size: 12px; }
   footer { text-align: center; color: var(--muted); font-size: 12px; padding: 8px 16px 24px; }
@@ -141,11 +158,21 @@
 
   <section class="card">
     <div class="list-head">
-      <h2>Scanned plots</h2>
+      <div class="title-row">
+        <h2>Scanned plots</h2>
+        <button id="searchBtn" class="icon-btn" type="button" aria-label="Search ILOs" aria-expanded="false">
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="2.4"/><line x1="15.5" y1="15.5" x2="21" y2="21" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"/></svg>
+        </button>
+      </div>
       <div class="row" style="flex:0 0 auto">
-        <button id="exportBtn" class="small">Export CSV</button>
+        <button id="exportBtn" class="small">Export zip</button>
+        <button id="exportCsvBtn" class="small secondary">CSV only</button>
         <button id="clearBtn" class="small danger">Clear</button>
       </div>
+    </div>
+    <div id="searchRow" class="search-row" hidden>
+      <input id="search" type="search" inputmode="numeric" autocomplete="off" placeholder="Search ILO, e.g. 9515">
+      <button id="searchClear" class="icon-btn" type="button" aria-label="Close search">✕</button>
     </div>
     <div id="summary"></div>
     <label class="toggle"><input id="onlyIncomplete" type="checkbox"> Show only ILOs with missing packs</label>
@@ -163,14 +190,22 @@
     </div>
   </div>
 </div>
-<footer>Photos are read on this phone and never uploaded. The list is saved on this phone only until you export it.</footer>
+<div id="lightbox" class="modal-bg" hidden>
+  <div class="lb-inner">
+    <img id="lightboxImg" alt="Scanned label">
+    <div class="lb-cap"><div class="lb-label">Saved in the list as</div><div id="lightboxIlo" class="lb-ilo"></div><div class="lb-hint">Tap anywhere to close</div></div>
+  </div>
+</div>
+<footer>Photos are read on this phone and never uploaded or added to your camera roll. The list and photos are kept inside this page on this phone until you export or clear them.</footer>
 
 <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 <script>
 (() => {
   const STORE_KEY = 'wipScanner.v1';
   const $ = id => document.getElementById(id);
+  const IMG_ICON = '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><rect x="3" y="4.5" width="18" height="15" rx="2.5" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="8.5" cy="9.5" r="1.8" fill="currentColor"/><path d="M4 17.5l5-5 3.5 3.5 2.5-2.5 5 4.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>';
 
   // ---------- storage (phone only) ----------
   let items = [];
@@ -179,6 +214,29 @@
   function persist() {
     try { localStorage.setItem(STORE_KEY, JSON.stringify(items)); } catch { /* private mode etc. */ }
   }
+
+  // Photos live in this page's IndexedDB (inside the browser, not the camera roll), keyed by scan id.
+  const photoDb = new Promise((res, rej) => {
+    try {
+      const req = indexedDB.open('wipScanner', 1);
+      req.onupgradeneeded = () => req.result.createObjectStore('photos');
+      req.onsuccess = () => res(req.result); req.onerror = () => rej(req.error);
+    } catch (e) { rej(e); }
+  });
+  photoDb.catch(() => {});
+  async function photoTx(mode, fn) {
+    const db = await photoDb;
+    return new Promise((res, rej) => {
+      const tx = db.transaction('photos', mode), r = fn(tx.objectStore('photos'));
+      tx.oncomplete = () => res(r && r.result); tx.onerror = () => rej(tx.error); tx.onabort = () => rej(tx.error);
+    });
+  }
+  const photoPut = (id, blob) => photoTx('readwrite', s => s.put(blob, id));
+  const photoGet = id => photoTx('readonly', s => s.get(id)).catch(() => null);
+  const photoDel = id => photoTx('readwrite', s => s.delete(id)).catch(() => {});
+  const photoClear = () => photoTx('readwrite', s => s.clear()).catch(() => {});
+  // Named by ILO; multi-pack ILOs add the pack so two photos never share a name.
+  const photoName = it => it.of > 1 ? `${it.ilo} (${it.pack} of ${it.of}).jpg` : `${it.ilo}.jpg`;
 
   // Group scans by ILO and work out which packs are still missing.
   function groupsOf(list) {
@@ -239,8 +297,12 @@
       : `<span class="badge ok">All scanned ILOs complete ✓</span>`;
     const ul = $('list'); ul.innerHTML = '';
     if (!items.length) { ul.innerHTML = '<li class="empty" style="border:0">Nothing scanned yet. Tap “Scan label” to start.</li>'; }
-    const shown = $('onlyIncomplete').checked ? open : groups;
-    if (items.length && !shown.length) ul.innerHTML = '<li class="empty" style="border:0">No missing packs 👍</li>';
+    const q = searchOpen() ? $('search').value.replace(/\D/g, '') : '';
+    let shown = $('onlyIncomplete').checked ? open : groups;
+    if (q) shown = shown.filter(g => g.ilo.includes(q));
+    if (items.length && !shown.length) ul.innerHTML = q
+      ? `<li class="empty" style="border:0">No ILO containing “${esc(q)}”${$('onlyIncomplete').checked ? ' with missing packs' : ''}.</li>`
+      : '<li class="empty" style="border:0">No missing packs 👍</li>';
     for (const g of shown) {
       const st = groupStatus(g);
       const li = document.createElement('li');
@@ -251,27 +313,59 @@
         if (!scans.length) { rows += `<div class="pack missing"><span class="pk">Pack ${n} of ${g.of}: not scanned yet</span></div>`; continue; }
         for (const it of scans) rows += `
           <div class="pack">
-            <div class="top"><span class="pk">${g.of > 1 ? `Pack ${it.pack} of ${it.of}` : 'Single pack'}</span><span class="meta">${esc(fmtTime(it.ts))}</span></div>
-            ${it.note ? `<div>${esc(it.note)}</div>` : ''}
-            <div class="meta">${it.lat != null ? `${it.lat.toFixed(6)}, ${it.lng.toFixed(6)} · ±${it.acc} m` : 'No location recorded'}</div>
+            <div class="pack-body">
+              <div>
+                <div class="top"><span class="pk">${g.of > 1 ? `Pack ${it.pack} of ${it.of}` : 'Single pack'}</span><span class="meta">${esc(fmtTime(it.ts))}</span></div>
+                ${it.note ? `<div>${esc(it.note)}</div>` : ''}
+                <div class="meta">${it.lat != null ? `${it.lat.toFixed(6)}, ${it.lng.toFixed(6)} · ±${it.acc} m` : 'No location recorded'}</div>
+              </div>
+              ${it.photo ? `<button class="icon-btn" type="button" data-act="photo" data-id="${it.id}" aria-label="View photo of ILO ${esc(it.ilo)} label">${IMG_ICON}</button>` : ''}
+            </div>
             <div class="acts">
               ${it.lat != null ? `<button class="small secondary" data-act="show" data-id="${it.id}">Show on map</button>` : ''}
               <button class="small danger" data-act="del" data-id="${it.id}">Delete</button>
             </div>
           </div>`;
       }
-      li.innerHTML = `<div class="top"><span class="num">ILO ${esc(g.ilo)}</span><span class="badge ${st.cls}">${esc(st.text)}</span></div>${rows}`;
+      const iloHtml = q ? esc(g.ilo).replace(q, `<mark>${q}</mark>`) : esc(g.ilo);
+      li.innerHTML = `<div class="top"><span class="num">ILO ${iloHtml}</span><span class="badge ${st.cls}">${esc(st.text)}</span></div>${rows}`;
       li.addEventListener('click', e => {
-        const { act, id } = e.target.dataset || {};
+        const { act, id } = e.target.closest('[data-act]')?.dataset || {};
         const it = items.find(x => x.id === id);
         if (!it) return;
         if (act === 'show') { map.setView([it.lat, it.lng], 19); markers.get(it.id)?.openPopup(); $('map').scrollIntoView({ behavior: 'smooth', block: 'center' }); }
-        if (act === 'del' && confirm(`Delete ILO ${it.ilo} pack ${it.pack} of ${it.of} from the list?`)) { items = items.filter(x => x.id !== it.id); persist(); render(); }
+        if (act === 'photo') openPhoto(it);
+        if (act === 'del' && confirm(`Delete ILO ${it.ilo} pack ${it.pack} of ${it.of} from the list?`)) { items = items.filter(x => x.id !== it.id); photoDel(it.id); persist(); render(); }
       });
       ul.appendChild(li);
     }
     drawMarkers(fit);
   }
+
+  // Popup shows the photo with the saved number underneath, so the two can be compared.
+  async function openPhoto(it) {
+    const blob = await photoGet(it.id);
+    if (!blob) { toast('warn', 'Photo not found on this phone.'); return; }
+    const img = $('lightboxImg');
+    if (img.src) URL.revokeObjectURL(img.src);
+    img.src = URL.createObjectURL(blob);
+    $('lightboxIlo').textContent = `ILO ${it.ilo}${it.of > 1 ? ` · ${it.pack} of ${it.of}` : ''}`;
+    $('lightbox').hidden = false;
+  }
+  $('lightbox').addEventListener('click', () => { $('lightbox').hidden = true; });
+
+  // ---------- search ----------
+  const searchOpen = () => !$('searchRow').hidden;
+  function setSearch(open) {
+    $('searchRow').hidden = !open;
+    $('searchBtn').setAttribute('aria-expanded', String(open));
+    if (open) $('search').focus(); else $('search').value = '';
+    render();
+  }
+  $('searchBtn').addEventListener('click', () => setSearch(!searchOpen()));
+  $('searchClear').addEventListener('click', () => setSearch(false));
+  $('search').addEventListener('input', () => render());
+  $('search').addEventListener('keydown', e => { if (e.key === 'Escape') setSearch(false); if (e.key === 'Enter') e.target.blur(); });
 
   // ---------- OCR ----------
   let workerPromise = null;
@@ -299,7 +393,13 @@
       ctx.putImageData(d, 0, 0);
       return c;
     };
-    return { big: sized(1800), small: sized(1200), url };
+    // Colour copy to keep with the scan: ~1400px JPEG is still readable and around 200–300 KB.
+    const ps = Math.min(1, 1400 / Math.max(img.naturalWidth, img.naturalHeight));
+    const pc = document.createElement('canvas');
+    pc.width = Math.round(img.naturalWidth * ps); pc.height = Math.round(img.naturalHeight * ps);
+    pc.getContext('2d').drawImage(img, 0, 0, pc.width, pc.height);
+    const photo = await new Promise(res => pc.toBlob(res, 'image/jpeg', 0.72));
+    return { big: sized(1800), small: sized(1200), url, photo };
   }
 
   // Try a few reading setups until one finds "ILO ######". Sparse-text mode (11) worked best in testing.
@@ -404,7 +504,7 @@
     try {
       const prepped = await prepImage(file);
       if (current?.url) URL.revokeObjectURL(current.url);
-      current = { url: prepped.url };
+      current = { url: prepped.url, photo: prepped.photo };
       $('preview').src = prepped.url;
       const worker = await getWorker();
       const { r, pk } = await readLabel(worker, prepped);
@@ -476,11 +576,22 @@
     const entry = {
       id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
       ilo, pack, of, ts: new Date().toISOString(), note: $('note').value.trim(),
-      lat: gps ? gps.lat : null, lng: gps ? gps.lng : null, acc: gps ? gps.acc : null
+      lat: gps ? gps.lat : null, lng: gps ? gps.lng : null, acc: gps ? gps.acc : null,
+      photo: !!current?.photo
     };
     items = items.filter(x => x !== same);
+    if (same) photoDel(same.id);
     items.push(entry); persist();
+    const photo = current?.photo;
+    current = null;
     closeReview(); render();
+    if (photo) {
+      photoPut(entry.id, photo).catch(() => {
+        entry.photo = false; persist(); render();
+        toast('warn', `ILO ${ilo} saved, but the photo couldn’t be kept (phone storage full or blocked).`);
+      });
+      if (navigator.storage?.persist) navigator.storage.persist().catch(() => {});
+    }
     if (entry.lat != null) { map.setView([entry.lat, entry.lng], 19); markers.get(entry.id)?.openPopup(); }
     const g = groupsOf(items).find(x => x.ilo === ilo), st = groupStatus(g);
     toast(st.cls, of > 1 ? `ILO ${ilo} pack ${pack} of ${of} saved. ${g.complete ? 'All packs scanned ✓' : st.text}` : `ILO ${ilo} saved ✓`);
@@ -510,39 +621,75 @@
   }
 
   // ---------- export ----------
-  $('exportBtn').addEventListener('click', async () => {
-    if (!items.length) { alert('Nothing to export yet.'); return; }
+  // photoFiles: Set of scan ids whose photo is in the export (null = CSV only, no Photo column).
+  function buildCsv(photoFiles) {
     const head = ['ILO', 'Pack', 'Of', 'ILO status', 'Scanned', 'Latitude', 'Longitude', 'Accuracy (m)', 'Note', 'Map link'];
+    if (photoFiles) head.push('Photo');
     const rows = [];
     for (const g of groupsOf(items)) {
       const status = groupStatus(g).text.replace(' ✓', '');
       for (let n = 1; n <= g.of; n++) {
         const scans = g.packs.filter(p => p.pack === n);
-        if (!scans.length) rows.push([g.ilo, n, g.of, status, 'NOT SCANNED', '', '', '', '', '']);
+        if (!scans.length) rows.push([g.ilo, n, g.of, status, 'NOT SCANNED', '', '', '', '', '', ...(photoFiles ? [''] : [])]);
         for (const it of scans) rows.push([
           it.ilo, it.pack, it.of, status, fmtTime(it.ts),
           it.lat != null ? it.lat.toFixed(6) : '', it.lng != null ? it.lng.toFixed(6) : '', it.acc ?? '', it.note || '',
-          it.lat != null ? `https://www.google.com/maps?q=${it.lat.toFixed(6)},${it.lng.toFixed(6)}` : ''
+          it.lat != null ? `https://www.google.com/maps?q=${it.lat.toFixed(6)},${it.lng.toFixed(6)}` : '',
+          ...(photoFiles ? [photoFiles.has(it.id) ? 'photos/' + photoName(it) : ''] : [])
         ]);
       }
     }
-    const csv = [head, ...rows].map(r => r.map(csvCell).join(',')).join('\r\n');
-    const name = `WIP scan ${new Date().toISOString().slice(0, 16).replace('T', ' ').replace(':', '')}.csv`;
-    const file = new File(['﻿' + csv], name, { type: 'text/csv' });
+    return '﻿' + [head, ...rows].map(r => r.map(csvCell).join(',')).join('\r\n');
+  }
+  const stamp = () => new Date().toISOString().slice(0, 16).replace('T', ' ').replace(':', '');
+
+  async function shareOrDownload(file) {
     if (navigator.canShare && navigator.canShare({ files: [file] })) {
       try { await navigator.share({ files: [file], title: 'WIP scan' }); return; }
       catch (err) { if (err.name === 'AbortError') return; }
     }
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(file); a.download = name;
+    a.href = URL.createObjectURL(file); a.download = file.name;
     document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  }
+
+  $('exportCsvBtn').addEventListener('click', () => {
+    if (!items.length) { alert('Nothing to export yet.'); return; }
+    shareOrDownload(new File([buildCsv(null)], `WIP scan ${stamp()}.csv`, { type: 'text/csv' }));
+  });
+
+  $('exportBtn').addEventListener('click', async () => {
+    if (!items.length) { alert('Nothing to export yet.'); return; }
+    if (typeof JSZip === 'undefined') { alert('The zip tool didn’t load (no signal?). Use “CSV only”, or try again with signal.'); return; }
+    const btn = $('exportBtn'); btn.disabled = true; btn.textContent = 'Zipping…';
+    try {
+      const zip = new JSZip(), included = new Set();
+      for (const it of items) {
+        if (!it.photo) continue;
+        const blob = await photoGet(it.id);
+        if (blob) { zip.file('photos/' + photoName(it), blob); included.add(it.id); }
+      }
+      zip.file(`WIP scan ${stamp()}.csv`, buildCsv(included));
+      // JPEGs are already compressed, so just store them (much faster on a phone).
+      const blob = await zip.generateAsync({ type: 'blob', compression: 'STORE' });
+      const mb = (blob.size / 1048576).toFixed(1);
+      const missing = items.filter(it => it.photo && !included.has(it.id)).length;
+      if (missing) toast('warn', `${missing} photo${missing === 1 ? '' : 's'} couldn’t be found and ${missing === 1 ? 'was' : 'were'} left out.`);
+      else toast('info', `Zip ready: ${included.size} photo${included.size === 1 ? '' : 's'}, ${mb} MB`);
+      await shareOrDownload(new File([blob], `WIP scan ${stamp()}.zip`, { type: 'application/zip' }));
+    } catch (err) {
+      console.error(err);
+      alert('Couldn’t build the zip. Try “CSV only”.');
+    } finally {
+      btn.disabled = false; btn.textContent = 'Export zip';
+    }
   });
 
   $('clearBtn').addEventListener('click', () => {
     if (!items.length) return;
-    if (!confirm(`Clear all ${items.length} scans from this phone? Export first if you need them.`)) return;
-    items = []; persist(); render();
+    if (!confirm(`Clear all ${items.length} scans and their photos from this phone? Export first if you need them.`)) return;
+    items = []; persist(); photoClear(); render();
   });
 
   // ---------- helpers ----------
